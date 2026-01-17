@@ -1,22 +1,18 @@
 /*
- * RC-based Thermal-Aware Scheduler (User Space)
+ * RC-Based Thermal-Aware Scheduler Controller (SAFE VERSION)
  *
- * Course Project Starter Code
+ * Course Project – User Space
  *
- * What this does:
- *  - Reads CPU temperature from Linux thermal sysfs
- *  - Estimates power using CPU utilization + frequency
- *  - Predicts future temperature using RC thermal model
- *  - Takes scheduling-related actions (hooks provided)
- *
- * What this does NOT do (yet):
- *  - No kernel modification
- *  - No aggressive task killing
+ * Key properties:
+ *  - DOES NOT modify kernel scheduler
+ *  - DOES NOT terminate processes
+ *  - Uses reversible, rate-limited mitigation
+ *  - Uses RC thermal prediction
  *
  * Compile:
  *   gcc rc_thermal_scheduler.c -o rc_sched -lm
  *
- * Run (needs root for freq control):
+ * Run:
  *   sudo ./rc_sched
  */
 
@@ -25,41 +21,55 @@
 #include <unistd.h>
 #include <math.h>
 #include <time.h>
+#include <string.h>
 
+/* =======================
+   PATHS
+   ======================= */
 #define TEMP_PATH "/sys/class/thermal/thermal_zone0/temp"
-#define FREQ_PATH "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
+#define FREQ_CUR_PATH "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
+#define FREQ_MAX_PATH "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"
 
 /* =======================
    RC MODEL PARAMETERS
    ======================= */
-#define R_THERMAL   1.0     // Thermal resistance (tunable)
-#define C_THERMAL   10.0    // Thermal capacitance (tunable)
-#define T_AMBIENT   30.0    // Ambient temperature (°C)
-#define DT          1.0     // Control interval (seconds)
+#define R_THERMAL   1.0
+#define C_THERMAL   10.0
+#define T_AMBIENT   30.0
+#define DT          1.0
 
 /* =======================
-   THERMAL LIMITS
+   HYSTERESIS LIMITS
    ======================= */
-#define T_SAFE      75.0
+#define T_HIGH      75.0
+#define T_LOW       70.0
 #define T_CRITICAL  85.0
 
 /* =======================
-   POWER MODEL PARAMS
+   POWER MODEL
    ======================= */
-#define ALPHA       5.0     // Power scaling constant
+#define ALPHA       5.0
+
+/* =======================
+   SAFETY PARAMETERS
+   ======================= */
+#define ACTION_COOLDOWN 5   // seconds between mitigation actions
+
+/* =======================
+   GLOBAL STATE
+   ======================= */
+static int mitigation_active = 0;
+static time_t last_action_time = 0;
+static int original_max_freq = -1;
 
 /* =======================
    Utility functions
    ======================= */
 
-/* Read temperature in Celsius */
 double read_temperature()
 {
     FILE *fp = fopen(TEMP_PATH, "r");
-    if (!fp) {
-        perror("Temperature read failed");
-        return -1.0;
-    }
+    if (!fp) return -1.0;
 
     int temp_milli;
     fscanf(fp, "%d", &temp_milli);
@@ -68,14 +78,10 @@ double read_temperature()
     return temp_milli / 1000.0;
 }
 
-/* Read CPU frequency in GHz */
 double read_frequency()
 {
-    FILE *fp = fopen(FREQ_PATH, "r");
-    if (!fp) {
-        perror("Frequency read failed");
-        return 1.0;
-    }
+    FILE *fp = fopen(FREQ_CUR_PATH, "r");
+    if (!fp) return -1.0;
 
     int freq_khz;
     fscanf(fp, "%d", &freq_khz);
@@ -84,16 +90,35 @@ double read_frequency()
     return freq_khz / 1e6;
 }
 
-/* Dummy CPU utilization estimator (replace later) */
+int read_max_frequency()
+{
+    FILE *fp = fopen(FREQ_MAX_PATH, "r");
+    if (!fp) return -1;
+
+    int freq;
+    fscanf(fp, "%d", &freq);
+    fclose(fp);
+
+    return freq;
+}
+
+void write_max_frequency(int freq)
+{
+    FILE *fp = fopen(FREQ_MAX_PATH, "w");
+    if (!fp) return;
+
+    fprintf(fp, "%d", freq);
+    fclose(fp);
+}
+
+/* Placeholder CPU utilization (safe default) */
 double estimate_utilization()
 {
-    /* Simple placeholder:
-       Assume high utilization for demo */
-    return 0.8;
+    return 0.7;
 }
 
 /* =======================
-   RC thermal prediction
+   RC Thermal Model
    ======================= */
 double predict_temperature(
     double T_curr,
@@ -107,26 +132,44 @@ double predict_temperature(
 }
 
 /* =======================
-   Scheduling actions
+   Safe mitigation logic
    ======================= */
-void apply_mitigation(double T_pred)
+int can_act()
 {
-    if (T_pred > T_CRITICAL) {
-        printf("!!! CRITICAL !!!: Predicted temp %.2f°C — migrate tasks / throttle hard\n", T_pred);
-        /* TODO:
-         * - sched_setaffinity()
-         * - aggressive freq scaling
-         */
-    }
-    else if (T_pred > T_SAFE) {
-        printf("!!!  WARNING !!!: Predicted temp %.2f°C — reducing frequency\n", T_pred);
-        /* TODO:
-         * - reduce CPU frequency
-         */
-    }
-    else {
-        printf("✅ OK: Predicted temp %.2f°C\n", T_pred);
-    }
+    time_t now = time(NULL);
+    return difftime(now, last_action_time) >= ACTION_COOLDOWN;
+}
+
+void enable_mitigation()
+{
+    if (mitigation_active || !can_act())
+        return;
+
+    original_max_freq = read_max_frequency();
+    if (original_max_freq <= 0)
+        return;
+
+    int reduced_freq = (int)(original_max_freq * 0.7);
+
+    write_max_frequency(reduced_freq);
+    mitigation_active = 1;
+    last_action_time = time(NULL);
+
+    printf("⚠️  Mitigation ENABLED: max freq capped\n");
+}
+
+void disable_mitigation()
+{
+    if (!mitigation_active || !can_act())
+        return;
+
+    if (original_max_freq > 0)
+        write_max_frequency(original_max_freq);
+
+    mitigation_active = 0;
+    last_action_time = time(NULL);
+
+    printf("✅ Mitigation DISABLED: freq restored\n");
 }
 
 /* =======================
@@ -134,18 +177,21 @@ void apply_mitigation(double T_pred)
    ======================= */
 int main()
 {
-    printf("RC-Based Thermal-Aware Scheduler Started\n");
-    printf("----------------------------------------\n");
+    printf("RC-Based Thermal-Aware Scheduler Controller (SAFE MODE)\n");
+    printf("------------------------------------------------------\n");
 
     while (1) {
         double T_curr = read_temperature();
         double freq   = read_frequency();
         double util   = estimate_utilization();
 
-        if (T_curr < 0)
+        if (T_curr < 0 || freq < 0) {
+            printf("Sensor read failed — entering safe mode\n");
+            disable_mitigation();
+            sleep((int)DT);
             continue;
+        }
 
-        /* Simple power model */
         double power = ALPHA * util * freq;
 
         double T_pred = predict_temperature(
@@ -157,10 +203,20 @@ int main()
             DT
         );
 
-        printf("T_curr = %.2f°C | T_pred = %.2f°C | P = %.2f W | f = %.2f GHz\n",
-               T_curr, T_pred, power, freq);
+        printf("T=%.2f°C | T_pred=%.2f°C | f=%.2f GHz | P=%.2f W\n",
+               T_curr, T_pred, freq, power);
 
-        apply_mitigation(T_pred);
+        /* Hysteresis-based control */
+        if (T_pred > T_HIGH) {
+            enable_mitigation();
+        }
+        else if (T_pred < T_LOW) {
+            disable_mitigation();
+        }
+
+        if (T_pred > T_CRITICAL) {
+            printf("CRITICAL predicted temperature — strong throttling advised\n");
+        }
 
         sleep((int)DT);
     }
